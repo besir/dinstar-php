@@ -1,0 +1,30 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Besir\Dinstar\Response;
+
+use Besir\Dinstar\Data\SendSmsData;
+
+class SendSmsResponse extends DinstarApiResponse
+{
+	private ?SendSmsData $data;
+
+	public function __construct(
+		public bool $success,
+		public int $httpCode,
+		public ?int $errorCode = null,
+		?SendSmsData $data = null,
+		public ?string $rawResponse = null,
+		public ?string $errorMessage = null,
+		public ?string $gatewaySn = null
+	) {
+		parent::__construct($success, $httpCode, $errorCode, null, $rawResponse, $errorMessage, $gatewaySn);
+		$this->data = $data;
+	}
+
+	public function getData(): ?SendSmsData
+	{
+		return $this->data;
+	}
+}
