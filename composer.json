@@ -1,0 +1,30 @@
+{
+	"name": "besir/dinstar-php",
+	"type": "library",
+	"description": "",
+	"keywords": ["Dinstar", "GSM", "PBX", "VoIP", "SIP", "API"],
+	"homepage": "https://github.com/besir/dinstar-php",
+	"license": ["MIT"],
+	"support": {
+		"issues": "https://github.com/besir/dinstar-php/issues"
+	},
+	"authors": [
+		{
+			"name": "Petr Besir Horáček",
+			"homepage": "https://besir.cz"
+		}
+	],
+	"autoload": {
+		"psr-4": {
+			"Besir\\Dinstar\\": "src/"
+		}
+	},
+	"require": {
+		"php": ">=8.2",
+		"ext-curl": "*"
+	},
+	"require-dev": {
+	},
+	"scripts": {
+	}
+}
