@@ -13,6 +13,7 @@ use Besir\Dinstar\Collection\PortInfoItemCollection;
 class DinstarApi
 {
 	private string $baseUrl;
+	private ?\CurlHandle $curl = null;
 
 	public function __construct(
 		private string $gatewayIp,
@@ -24,6 +25,45 @@ class DinstarApi
 		private int $numberOfPorts = 8,
 	) {
 		$this->baseUrl = str_starts_with($gatewayIp, 'http') ? $gatewayIp : "https://{$gatewayIp}";
+	}
+
+	public function __destruct()
+	{
+		if ($this->curl !== null) {
+			curl_close($this->curl);
+			$this->curl = null;
+		}
+	}
+
+	/**
+	 * Resets the connection by closing the curl handle.
+	 * Next request will create a fresh connection.
+	 */
+	public function resetConnection(): void
+	{
+		if ($this->curl !== null) {
+			curl_close($this->curl);
+			$this->curl = null;
+		}
+	}
+
+	/**
+	 * Gets or creates a persistent curl handle.
+	 * The handle is reused for connection pooling, but options are reset per-request.
+	 *
+	 * @return \CurlHandle
+	 * @throws \RuntimeException if curl initialization fails
+	 */
+	private function getCurl(): \CurlHandle
+	{
+		if ($this->curl === null) {
+			$this->curl = curl_init();
+			if ($this->curl === false) {
+				throw new \RuntimeException('cURL initialization failed.');
+			}
+		}
+
+		return $this->curl;
 	}
 
 	public function sendSms(
@@ -453,46 +493,61 @@ class DinstarApi
 	 * 'decodedBody' (?array): JSON decoded response body, or null if decoding failed or empty.
 	 * 'rawBody' (string): Raw response body.
 	 * 'curlError' (?string): cURL error message if any.
+	 *
+	 * @param string $path API path
+	 * @param string $method HTTP method
+	 * @param array $data Request data
+	 * @param bool $useApiPrefix Whether to prefix path with /api/
+	 * @param bool $isRetry Whether this is a retry attempt (internal use)
 	 */
-	private function _makeRequest(string $path, string $method = 'GET', array $data = [], bool $useApiPrefix = true): array
-	{
+	private function _makeRequest(
+		string $path,
+		string $method = 'GET',
+		array $data = [],
+		bool $useApiPrefix = true,
+		bool $isRetry = false
+	): array {
 		$urlPath = ($useApiPrefix ? '/api/' : '') . $path;
 		$url = $this->baseUrl . $urlPath;
 		$method = strtoupper($method);
 
-		$curl = curl_init();
-		if ($curl === false) {
-			error_log("cURL initialization failed.");
-			return ['httpSuccessful' => false, 'httpCode' => 0, 'decodedBody' => null, 'rawBody' => '', 'curlError' => "cURL initialization failed."];
+		try {
+			$curl = $this->getCurl();
+		} catch (\RuntimeException $e) {
+			error_log("cURL initialization failed: " . $e->getMessage());
+			return ['httpSuccessful' => false, 'httpCode' => 0, 'decodedBody' => null, 'rawBody' => '', 'curlError' => $e->getMessage()];
 		}
 
-		$headers = [];
-		$postData = null;
+		// Reset all options to defaults but keep connection alive
+		curl_reset($curl);
 
-		if ($method === 'GET' && ! empty($data)) {
-			$url .= '?' . http_build_query($data);
-		} elseif ($method === 'POST') {
-			$postData = json_encode($data);
-			if ($postData === false) {
-				error_log("JSON encoding failed for POST data. Error: " . json_last_error_msg());
-				curl_close($curl);
-				return ['httpSuccessful' => false, 'httpCode' => 0, 'decodedBody' => null, 'rawBody' => '', 'curlError' => "JSON encoding failed."];
-			}
-			curl_setopt($curl, CURLOPT_POSTFIELDS, $postData);
-		}
-
-		curl_setopt($curl, CURLOPT_URL, $url);
-		curl_setopt($curl, CURLOPT_HTTPAUTH, CURLAUTH_ANY);
+		// Re-apply common options after reset
+		// Use CURLAUTH_DIGEST to avoid probe request that CURLAUTH_ANY does (which gateway may count as failed attempt)
+		curl_setopt($curl, CURLOPT_HTTPAUTH, CURLAUTH_DIGEST);
 		curl_setopt($curl, CURLOPT_USERPWD, $this->username . ":" . $this->password);
 		curl_setopt($curl, CURLOPT_SSL_VERIFYPEER, !$this->disableSslVerification);
 		curl_setopt($curl, CURLOPT_SSL_VERIFYHOST, 0);
 		curl_setopt($curl, CURLOPT_FOLLOWLOCATION, true);
 		curl_setopt($curl, CURLOPT_CONNECTTIMEOUT, $this->connectTimeout);
 		curl_setopt($curl, CURLOPT_TIMEOUT, $this->timeout);
-		curl_setopt($curl, CURLOPT_CUSTOMREQUEST, $method);
 		curl_setopt($curl, CURLOPT_UNRESTRICTED_AUTH, 1);
 		curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+		curl_setopt($curl, CURLOPT_FORBID_REUSE, false);
+		curl_setopt($curl, CURLOPT_FRESH_CONNECT, false);
 
+		if ($method === 'GET' && !empty($data)) {
+			$url .= '?' . http_build_query($data);
+		} elseif ($method === 'POST') {
+			$postData = json_encode($data);
+			if ($postData === false) {
+				error_log("JSON encoding failed for POST data. Error: " . json_last_error_msg());
+				return ['httpSuccessful' => false, 'httpCode' => 0, 'decodedBody' => null, 'rawBody' => '', 'curlError' => "JSON encoding failed."];
+			}
+			curl_setopt($curl, CURLOPT_POSTFIELDS, $postData);
+		}
+
+		curl_setopt($curl, CURLOPT_URL, $url);
+		curl_setopt($curl, CURLOPT_CUSTOMREQUEST, $method);
 		curl_setopt($curl, CURLOPT_HTTPHEADER, [
 			'Content-Type: application/json',
 			'Connection: Keep-Alive',
@@ -502,9 +557,25 @@ class DinstarApi
 		$responseBody = curl_exec($curl);
 		$httpCode = curl_getinfo($curl, CURLINFO_HTTP_CODE);
 		$curlError = curl_error($curl);
-		curl_close($curl);
 
-		if ($responseBody === false || ! empty($curlError)) {
+		// Retry logic for 401 (Unauthorized) or 403 (Forbidden) - likely a session problem on gateway side
+		if (($httpCode === 401 || $httpCode === 403) && !$isRetry) {
+			$maskedPassword = $this->maskPassword($this->password);
+			$bodyPreview = is_string($responseBody) ? substr($responseBody, 0, 200) : '(empty)';
+			error_log("Got {$httpCode} from {$url}, user='{$this->username}', pass='{$maskedPassword}', body='{$bodyPreview}', retrying with fresh connection after 500ms delay...");
+			usleep(500000); // 500ms delay
+			$this->resetConnection();
+			return $this->_makeRequest($path, $method, $data, $useApiPrefix, true);
+		}
+
+		// Log auth failure after retry
+		if (($httpCode === 401 || $httpCode === 403) && $isRetry) {
+			$maskedPassword = $this->maskPassword($this->password);
+			$bodyPreview = is_string($responseBody) ? substr($responseBody, 0, 200) : '(empty)';
+			error_log("Auth failed after retry: {$httpCode} from {$url}, user='{$this->username}', pass='{$maskedPassword}', body='{$bodyPreview}'");
+		}
+
+		if ($responseBody === false || !empty($curlError)) {
 			$error = $curlError ?: 'Unknown cURL error';
 			error_log("cURL error: {$error} (URL: {$url}, HTTP Code: {$httpCode})");
 			return ['httpSuccessful' => false, 'httpCode' => $httpCode, 'decodedBody' => null, 'rawBody' => (string)$responseBody, 'curlError' => $error];
@@ -547,5 +618,18 @@ class DinstarApi
 		$result = implode(',', $range);
 
 		return $result;
+	}
+
+	/**
+	 * Masks password for logging - shows first and last char with dots in between.
+	 * Example: "password123" -> "p.........3"
+	 */
+	private function maskPassword(string $password): string
+	{
+		$len = strlen($password);
+		if ($len <= 2) {
+			return str_repeat('*', $len);
+		}
+		return $password[0] . str_repeat('.', $len - 2) . $password[$len - 1];
 	}
 }
